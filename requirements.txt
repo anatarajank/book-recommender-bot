@@ -1,5 +1,7 @@
 flask
+gunicorn
 openai
 botbuilder-core
-requests
+botframework-connector
+msrest
 aiohttp
