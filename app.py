@@ -229,10 +229,25 @@ def background_process(activity: Activity):
             print(f"DEBUG: User query: {user_text}")
 
             # Call Azure OpenAI chat completion
+            system_prompt = (
+                "You are a helpful book recommendation assistant. "
+                "Format your responses to be visually appealing in a chat app.\n\n"
+                "Formatting rules:\n"
+                "- Use emojis to make responses engaging (📚 for books, ⭐ for ratings, "
+                "✍️ for authors, 📖 for genres, 💡 for tips)\n"
+                "- Use numbered lists with emojis for book recommendations\n"
+                "- Structure each recommendation as:\n"
+                "  📚 Book Title by ✍️ Author Name\n"
+                "  ⭐ Brief reason why it's recommended\n"
+                "- Add a short intro and a friendly closing line\n"
+                "- Do NOT use markdown formatting like **, __, `, or # — "
+                "only use plain text with emojis and line breaks\n"
+                "- Keep responses concise but informative"
+            )
             completion = client.chat.completions.create(
                 model=os.getenv("DEPLOYMENT_NAME"),
                 messages=[
-                    {"role": "system", "content": "You are a helpful book recommendation assistant."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text}
                 ]
             )
