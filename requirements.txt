@@ -2,3 +2,4 @@ flask
 openai
 botbuilder-core
 requests
+aiohttp
