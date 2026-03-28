@@ -191,8 +191,15 @@ def background_process(activity: Activity):
             )
 
             # Define the callback that sends the reply via turn_context
+            # Send as plain text to avoid Telegram MarkdownV2 parsing errors
+            # (characters like . ! - ( ) are reserved in MarkdownV2)
             async def reply_callback(turn_context: TurnContext):
-                await turn_context.send_activity(reply_text)
+                reply_activity = Activity(
+                    type=ActivityTypes.message,
+                    text=reply_text,
+                    text_format="plain"
+                )
+                await turn_context.send_activity(reply_activity)
 
             # Use continue_conversation to proactively send the reply
             await adapter.continue_conversation(
