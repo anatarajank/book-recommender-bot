@@ -5,35 +5,45 @@ from flask import Flask, request, Response
 from openai import AzureOpenAI
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings
 from botbuilder.schema import Activity, ActivityTypes
+from botframework.connector.auth import MicrosoftAppCredentials
 
 app = Flask(__name__)
 
 # 1. Initialize Azure OpenAI Client
+# Note: Ensure these match your Azure Environment Variable Names exactly
 client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     api_version=os.getenv("OPENAI_API_VERSION", "2024-02-01"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
 )
 
-# 2. Setup Bot Framework Adapter with your verified credentials
-# Note: Ensure MicrosoftAppTenantId is set in Azure for SingleTenant bots
+# 2. Setup Bot Framework Adapter for Single-Tenant
+# We MUST include channel_auth_tenant for the proactive reply to work
 settings = BotFrameworkAdapterSettings(
     app_id=os.getenv("MicrosoftAppId"),
-    app_password=os.getenv("MicrosoftAppPassword")
+    app_password=os.getenv("MicrosoftAppPassword"),
+    channel_auth_tenant=os.getenv("MicrosoftAppTenantId") # Crucial for Single-Tenant
 )
 adapter = BotFrameworkAdapter(settings)
 
 # 3. Background Task: AI Logic & Proactive Response
 def background_process(activity: Activity):
     """
-    Handles the long-running OpenAI call and sends the reply back.
+    Handles OpenAI call and sends the reply back.
     Runs in a separate thread to beat the 15s Azure timeout.
     """
     async def send_reply():
         try:
-            # Only process if the activity is a message
+            # Acknowledge receipt in logs
+            print(f"DEBUG: Processing message: {activity.text}")
+
+            # Verify activity type
             if activity.type != ActivityTypes.message:
                 return
+
+            # REQUIRED for Proactive Messaging: Trust the service URL (Telegram/WebChat)
+            # This allows the bot to send a message back to the user's specific channel
+            MicrosoftAppCredentials.trust_service_url(activity.service_url)
 
             # Call Azure OpenAI
             completion = client.chat.completions.create(
@@ -56,18 +66,21 @@ def background_process(activity: Activity):
                 service_url=activity.service_url
             )
 
-            # Send the reply back to Telegram/WebChat via the adapter
-            # This requires an async context
+            # Send the reply back
             await adapter.send_activity(response_activity)
+            print("DEBUG: Reply sent successfully.")
 
         except Exception as e:
-            print(f"Error in background_process: {e}")
+            # This will now appear in your Azure Log Stream
+            print(f"ERROR in background_process: {str(e)}")
 
-    # Run the async helper in the background thread's loop
+    # Standard Asyncio loop boilerplate for a thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(send_reply())
-    loop.close()
+    try:
+        loop.run_until_complete(send_reply())
+    finally:
+        loop.close()
 
 # 4. Main Webhook Endpoint
 @app.route("/api/messages", methods=["POST"])
@@ -80,16 +93,16 @@ def messages():
     else:
         return Response(status=415)
 
+    # Deserialize the incoming request into an Activity object
     activity = Activity().deserialize(body)
     
-    # Check if the activity is a user message
     if activity.type == ActivityTypes.message:
-        # Launch the background thread for the AI logic
-        # This allows us to return 200 OK to Azure immediately
+        # Launch the thread so we can return 200 OK immediately
         thread = threading.Thread(target=background_process, args=(activity,))
+        thread.daemon = True # Ensures thread dies if main process exits
         thread.start()
 
-    # Return 200 OK immediately (well within the 15s limit)
+    # Return 200 OK immediately to satisfy the 15s Azure timeout
     return Response(status=200)
 
 if __name__ == "__main__":
