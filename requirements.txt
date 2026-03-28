@@ -1,4 +1,4 @@
 flask
-gunicorn
 openai
+botbuilder-core
 requests
