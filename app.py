@@ -1,6 +1,7 @@
 import os
 import asyncio
 import threading
+import requests as http_requests
 from flask import Flask, request, Response
 from openai import AzureOpenAI
 from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
@@ -24,6 +25,127 @@ settings = BotFrameworkAdapterSettings(
 )
 adapter = BotFrameworkAdapter(settings)
 
+# Audio content types we recognise as voice messages
+AUDIO_CONTENT_TYPES = {"audio/ogg", "audio/mpeg", "audio/wav", "audio/mp4", "audio/webm", "audio/ogg; codecs=opus"}
+
+
+# ---------- helpers ----------
+
+def _get_bot_auth_token() -> str:
+    """
+    Obtain a Bearer token from Azure AD so we can download attachments
+    that are hosted on the Bot Framework service URL.
+    """
+    app_id = os.getenv("MicrosoftAppId")
+    app_pw = os.getenv("MicrosoftAppPassword")
+    tenant = os.getenv("MicrosoftAppTenantId", "botframework.com")
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+    resp = http_requests.post(token_url, data={
+        "grant_type": "client_credentials",
+        "client_id": app_id,
+        "client_secret": app_pw,
+        "scope": "https://api.botframework.com/.default"
+    })
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _download_attachment(url: str, service_url: str) -> bytes:
+    """
+    Downloads an attachment. If the file is hosted on the Bot Connector
+    (service_url domain), we attach a Bearer token; otherwise we do a
+    plain GET (e.g. Telegram CDN links come pre-authenticated).
+    """
+    headers = {}
+    # Bot-connector-hosted attachments need auth
+    if service_url and url.startswith(service_url):
+        token = _get_bot_auth_token()
+        headers["Authorization"] = f"Bearer {token}"
+
+    resp = http_requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _transcribe_audio(audio_bytes: bytes, content_type: str = "audio/ogg") -> str:
+    """
+    Transcribes audio using Azure Speech Service REST API.
+    Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your App Service env vars.
+    Supports: audio/ogg (Telegram voice), audio/wav, audio/webm.
+    """
+    speech_key = os.getenv("AZURE_SPEECH_KEY")
+    speech_region = os.getenv("AZURE_SPEECH_REGION")
+
+    if not speech_key or not speech_region:
+        raise ValueError("AZURE_SPEECH_KEY and AZURE_SPEECH_REGION must be set")
+
+    # Map common content types to what the Speech REST API expects
+    content_type_map = {
+        "audio/ogg": "audio/ogg; codecs=opus",
+        "audio/webm": "audio/webm; codecs=opus",
+        "audio/wav": "audio/wav; codecs=audio/pcm; samplerate=16000",
+        "audio/wave": "audio/wav; codecs=audio/pcm; samplerate=16000",
+        "audio/x-wav": "audio/wav; codecs=audio/pcm; samplerate=16000",
+    }
+    api_content_type = content_type_map.get(content_type, "audio/ogg; codecs=opus")
+
+    url = (
+        f"https://{speech_region}.stt.speech.microsoft.com"
+        f"/speech/recognition/conversation/cognitiveservices/v1"
+    )
+    params = {"language": os.getenv("SPEECH_LANGUAGE", "en-US")}
+    headers = {
+        "Ocp-Apim-Subscription-Key": speech_key,
+        "Content-Type": api_content_type,
+        "Accept": "application/json"
+    }
+
+    resp = http_requests.post(url, params=params, headers=headers,
+                              data=audio_bytes, timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+
+    if result.get("RecognitionStatus") == "Success":
+        return result["DisplayText"]
+    else:
+        print(f"DEBUG: Speech recognition status: {result.get('RecognitionStatus')}")
+        return None
+
+
+def _extract_user_text(activity: Activity) -> str | None:
+    """
+    Returns the user's message as text.
+    - If the user typed a text message, return activity.text.
+    - If the user sent a voice/audio attachment, download & transcribe it.
+    - Returns None if we can't extract anything useful.
+    """
+    # 1. Check for audio attachments first
+    if activity.attachments:
+        for attachment in activity.attachments:
+            content_type = (attachment.content_type or "").lower().split(";")[0].strip()
+            full_content_type = (attachment.content_type or "").lower()
+
+            if content_type.startswith("audio/") or full_content_type in AUDIO_CONTENT_TYPES:
+                print(f"DEBUG: Voice attachment detected — type={attachment.content_type}")
+                audio_bytes = _download_attachment(
+                    attachment.content_url,
+                    activity.service_url
+                )
+                print(f"DEBUG: Downloaded {len(audio_bytes)} bytes of audio")
+
+                transcribed = _transcribe_audio(audio_bytes, content_type)
+                print(f"DEBUG: Transcription result: {transcribed}")
+                return transcribed
+
+    # 2. Fall back to plain text
+    if activity.text:
+        return activity.text
+
+    return None
+
+
+# ---------- core ----------
 
 # 3. Background Task: AI Logic & Proactive Response
 def background_process(activity: Activity):
@@ -33,20 +155,26 @@ def background_process(activity: Activity):
     """
     async def send_reply():
         try:
-            print(f"DEBUG: Processing message: {activity.text}")
-
             if activity.type != ActivityTypes.message:
                 return
 
             # Trust the service URL for proactive messaging
             MicrosoftAppCredentials.trust_service_url(activity.service_url)
 
-            # Call Azure OpenAI
+            # Extract text — either typed or voice-transcribed
+            user_text = _extract_user_text(activity)
+            if not user_text:
+                print("DEBUG: No text or audio found in activity, skipping.")
+                return
+
+            print(f"DEBUG: User query: {user_text}")
+
+            # Call Azure OpenAI chat completion
             completion = client.chat.completions.create(
                 model=os.getenv("DEPLOYMENT_NAME"),
                 messages=[
                     {"role": "system", "content": "You are a helpful book recommendation assistant."},
-                    {"role": "user", "content": activity.text}
+                    {"role": "user", "content": user_text}
                 ]
             )
             reply_text = completion.choices[0].message.content
