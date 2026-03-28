@@ -28,6 +28,9 @@ adapter = BotFrameworkAdapter(settings)
 # Audio content types we recognise as voice messages
 AUDIO_CONTENT_TYPES = {"audio/ogg", "audio/mpeg", "audio/wav", "audio/mp4", "audio/webm", "audio/ogg; codecs=opus"}
 
+# Image content types we recognise for OCR
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/bmp", "image/gif", "image/webp"}
+
 
 # ---------- helpers ----------
 
@@ -113,19 +116,56 @@ def _transcribe_audio(audio_bytes: bytes, content_type: str = "audio/ogg") -> st
         return None
 
 
+def _extract_text_from_image(image_bytes: bytes) -> str | None:
+    """
+    Extracts text from an image using Azure Computer Vision OCR REST API.
+    Set AZURE_CV_KEY and AZURE_CV_ENDPOINT in your App Service env vars.
+    """
+    cv_key = os.getenv("AZURE_CV_KEY")
+    cv_endpoint = os.getenv("AZURE_CV_ENDPOINT")  # e.g. https://cv-new-final.cognitiveservices.azure.com/
+
+    if not cv_key or not cv_endpoint:
+        raise ValueError("AZURE_CV_KEY and AZURE_CV_ENDPOINT must be set")
+
+    # Use the OCR API (synchronous, ideal for book covers / short text)
+    url = f"{cv_endpoint.rstrip('/')}/vision/v3.2/ocr"
+    params = {"language": "en", "detectOrientation": "true"}
+    headers = {
+        "Ocp-Apim-Subscription-Key": cv_key,
+        "Content-Type": "application/octet-stream"
+    }
+
+    resp = http_requests.post(url, params=params, headers=headers,
+                              data=image_bytes, timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+
+    # Parse OCR response: regions -> lines -> words
+    lines = []
+    for region in result.get("regions", []):
+        for line in region.get("lines", []):
+            words = [w["text"] for w in line.get("words", [])]
+            if words:
+                lines.append(" ".join(words))
+
+    extracted = "\n".join(lines)
+    return extracted if extracted.strip() else None
+
+
 def _extract_user_text(activity: Activity) -> str | None:
     """
     Returns the user's message as text.
     - If the user typed a text message, return activity.text.
     - If the user sent a voice/audio attachment, download & transcribe it.
+    - If the user sent an image, extract text via OCR.
     - Returns None if we can't extract anything useful.
     """
-    # 1. Check for audio attachments first
     if activity.attachments:
         for attachment in activity.attachments:
             content_type = (attachment.content_type or "").lower().split(";")[0].strip()
             full_content_type = (attachment.content_type or "").lower()
 
+            # --- Audio / Voice ---
             if content_type.startswith("audio/") or full_content_type in AUDIO_CONTENT_TYPES:
                 print(f"DEBUG: Voice attachment detected — type={attachment.content_type}")
                 audio_bytes = _download_attachment(
@@ -133,12 +173,31 @@ def _extract_user_text(activity: Activity) -> str | None:
                     activity.service_url
                 )
                 print(f"DEBUG: Downloaded {len(audio_bytes)} bytes of audio")
-
                 transcribed = _transcribe_audio(audio_bytes, content_type)
                 print(f"DEBUG: Transcription result: {transcribed}")
                 return transcribed
 
-    # 2. Fall back to plain text
+            # --- Image / OCR ---
+            if content_type in IMAGE_CONTENT_TYPES:
+                print(f"DEBUG: Image attachment detected — type={attachment.content_type}")
+                image_bytes = _download_attachment(
+                    attachment.content_url,
+                    activity.service_url
+                )
+                print(f"DEBUG: Downloaded {len(image_bytes)} bytes of image")
+                extracted = _extract_text_from_image(image_bytes)
+                print(f"DEBUG: OCR extracted text: {extracted}")
+                if extracted:
+                    # Provide context so GPT knows the text came from an image
+                    return (
+                        f"The user sent an image containing the following text:\n"
+                        f"{extracted}\n\n"
+                        f"Based on this text, provide relevant book recommendations."
+                    )
+                else:
+                    return "The user sent an image but no text could be extracted from it. Ask them to send a clearer image or type their request."
+
+    # Fall back to plain text
     if activity.text:
         return activity.text
 
